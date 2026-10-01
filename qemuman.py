@@ -109,11 +109,13 @@ class Manager:
 
         self.qemu_ram_gb = tk.StringVar(value="4")
 
+        self.config = self.load_config()
+        self.qemu_use_cdrom = tk.BooleanVar(value=self.config.get("use_cdrom", True))
+        self.qemu_use_cdrom.trace_add("write", self.on_cdrom_toggle)
+
         self.qemu_ssh_enabled = tk.BooleanVar(value=True)
         self.qemu_ssh_host_port = tk.StringVar(value="2222")
         self.qemu_ssh_guest_port = tk.StringVar(value="22")
-
-        self.config = self.load_config()
 
         atexit.register(self.exit_handler)
 
@@ -154,6 +156,14 @@ class Manager:
         self.save_config()
         box = self.cdrom_path if key == "iso_history" else self.hdd_path
         box["values"] = self.config[key]
+
+    def on_cdrom_toggle(self, *_):
+        self.config["use_cdrom"] = self.qemu_use_cdrom.get()
+        self.save_config()
+        if hasattr(self, "cdrom_path"):
+            self.cdrom_path.configure(
+                state="normal" if self.qemu_use_cdrom.get() else "disabled"
+            )
 
     def is_tool(self, name):
         # Check whether `name` is on PATH and marked as executable
@@ -235,8 +245,20 @@ class Manager:
                 )
                 return 1
 
+            use_cdrom = self.qemu_use_cdrom.get()
+            hdd = self.hdd_path.get().strip()
+
+            # Without a CD-ROM there must be an HDD to boot from
+            if not use_cdrom and not os.path.exists(hdd):
+                alert(
+                    "Unable to start the VM",
+                    "CD-ROM is disabled, so the HDD file must exist to boot from it.",
+                    icon="error",
+                )
+                return 1
+
             # Check if the CD-ROM file exists
-            if not os.path.exists(self.cdrom_path.get()):
+            if use_cdrom and not os.path.exists(self.cdrom_path.get()):
                 alert(
                     "Unable to start the VM",
                     "The specified CD-ROM file does not exist",
@@ -277,18 +299,21 @@ class Manager:
             cmd = [
                 self.qemu_type_box.get(),
                 "-m", str(int(ram_gb * 1024)),
-                "-cdrom", self.cdrom_path.get(),
             ]
-            hdd = self.hdd_path.get()
+            if use_cdrom:
+                cmd += ["-cdrom", self.cdrom_path.get()]
             if hdd and os.path.exists(hdd):
                 cmd += ["-hda", hdd]
+                if not use_cdrom:
+                    cmd += ["-boot", "c"]
             cmd += nic
             if self.qemu_sdl_window.get():
                 cmd += ["-sdl"]
             if self.qemu_use_haxm.get():
                 cmd += ["-accel", "hax"]
 
-            self.remember_path("iso_history", self.cdrom_path.get())
+            if use_cdrom:
+                self.remember_path("iso_history", self.cdrom_path.get())
             if hdd:
                 self.remember_path("hdd_history", hdd)
 
@@ -392,12 +417,14 @@ class Manager:
         self.qemu_type_box.current(1)
         self.qemu_type_box.pack(fill=tk.X, padx=15, pady=5)
 
-        cdrom_path_label = ttk.Label(
+        cdrom_toggle = ttk.Checkbutton(
             self.root,
-            text="CD-ROM (ISO) File Path:",
-            background=self.root.cget("background"),
+            text="Use CD-ROM (ISO) File Path:",
+            variable=self.qemu_use_cdrom,
+            offvalue=False,
+            onvalue=True,
         )
-        cdrom_path_label.pack(fill="x", padx=15, pady=5)
+        cdrom_toggle.pack(fill="x", padx=15, pady=5)
 
         self.cdrom_path_text = tk.StringVar()
         iso_hist = self.config["iso_history"]
@@ -410,6 +437,7 @@ class Manager:
             self.root, textvariable=self.cdrom_path_text, values=iso_hist
         )
         self.cdrom_path.pack(fill="x", padx=15)
+        self.on_cdrom_toggle()
         self.cdrom_path.focus()
 
         hdd_path_label = ttk.Label(
