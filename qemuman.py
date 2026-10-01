@@ -114,6 +114,8 @@ class Manager:
         self.config = self.load_config()
         self.qemu_use_cdrom = tk.BooleanVar(value=self.config.get("use_cdrom", True))
         self.qemu_use_cdrom.trace_add("write", self.on_cdrom_toggle)
+        self.qemu_use_hdd = tk.BooleanVar(value=self.config.get("use_hdd", True))
+        self.qemu_use_hdd.trace_add("write", self.on_hdd_toggle)
 
         self.qemu_use_phys = tk.BooleanVar(value=False)
         self.qemu_phys_path = tk.StringVar(value=r"\\.\PhysicalDrive")
@@ -207,6 +209,14 @@ class Manager:
                 return path
         return None
 
+    def on_hdd_toggle(self, *_):
+        self.config["use_hdd"] = self.qemu_use_hdd.get()
+        self.save_config()
+        if hasattr(self, "hdd_path"):
+            state = "normal" if self.qemu_use_hdd.get() else "disabled"
+            self.hdd_path.configure(state=state)
+            self.create_hdd_btn.configure(state=state)
+
     def is_tool(self, name):
         # Check whether `name` is on PATH and marked as executable
         # https://stackoverflow.com/a/34177358/15871490
@@ -288,7 +298,8 @@ class Manager:
                 return 1
 
             use_cdrom = self.qemu_use_cdrom.get()
-            hdd = self.hdd_path.get().strip()
+            use_hdd = self.qemu_use_hdd.get()
+            hdd = self.hdd_path.get().strip() if use_hdd else ""
 
             use_phys = self.qemu_use_phys.get()
             phys = self.qemu_phys_path.get().split(" - ")[0].strip()
@@ -298,7 +309,7 @@ class Manager:
             if not use_cdrom and not use_phys and not os.path.exists(hdd):
                 alert(
                     "Unable to start the VM",
-                    "CD-ROM is disabled, so the HDD file or a physical drive must be set to boot from.",
+                    "Nothing to boot from: enable the CD-ROM, an existing HDD file or a physical drive.",
                     icon="error",
                 )
                 return 1
@@ -540,12 +551,14 @@ class Manager:
         self.on_cdrom_toggle()
         self.cdrom_path.focus()
 
-        hdd_path_label = ttk.Label(
+        hdd_toggle = ttk.Checkbutton(
             self.root,
-            text="HDD (QCOW2) File Path:",
-            background=self.root.cget("background"),
+            text="Use HDD (QCOW2) File Path:",
+            variable=self.qemu_use_hdd,
+            offvalue=False,
+            onvalue=True,
         )
-        hdd_path_label.pack(fill="x", padx=15, pady=5)
+        hdd_toggle.pack(fill="x", padx=15, pady=5)
 
         self.hdd_path_text = tk.StringVar()
         hdd_hist = self.config["hdd_history"]
@@ -570,6 +583,7 @@ class Manager:
         self.create_hdd_btn.grid(row=0, column=1, padx=(5, 15))
 
         self.hdd_path_frame.pack(fill="x")
+        self.on_hdd_toggle()
 
         phys_check = ttk.Checkbutton(
             self.root,
