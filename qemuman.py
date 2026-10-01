@@ -1,13 +1,15 @@
 # A small manager program for QEMU. Tested on Windows
 # https://github.com/equa-tory/qemuman (forked from https://github.com/yeppiidev/qemu-manager)
 
+import ctypes
 import json
 import os
+import subprocess
 import tkinter as tk
 import atexit
 
 from subprocess import PIPE
-from subprocess import Popen, CalledProcessError, run
+from subprocess import Popen, CalledProcessError, run, CREATE_NEW_CONSOLE
 
 from tkinter.messagebox import showinfo as alert
 from tkinter.messagebox import askyesno as confirm
@@ -90,7 +92,7 @@ class Manager:
     def __init__(self) -> None:
         self.root = ThemedTk()
         self.root.title("QEMU Manager")
-        self.root.geometry("600x560")
+        self.root.geometry("600x680")
         self.root.wm_resizable(False, False)
 
         self.root.style = ttk.Style()
@@ -112,6 +114,10 @@ class Manager:
         self.config = self.load_config()
         self.qemu_use_cdrom = tk.BooleanVar(value=self.config.get("use_cdrom", True))
         self.qemu_use_cdrom.trace_add("write", self.on_cdrom_toggle)
+
+        self.qemu_use_phys = tk.BooleanVar(value=False)
+        self.qemu_phys_path = tk.StringVar(value=r"\\.\PhysicalDrive")
+        self.qemu_phys_readonly = tk.BooleanVar(value=True)
 
         self.qemu_ssh_enabled = tk.BooleanVar(value=True)
         self.qemu_ssh_host_port = tk.StringVar(value="2222")
@@ -164,6 +170,42 @@ class Manager:
             self.cdrom_path.configure(
                 state="normal" if self.qemu_use_cdrom.get() else "disabled"
             )
+
+    def list_physical_drives(self):
+        # Windows only: returns ["\\.\PHYSICALDRIVE4 - Model (64 GB)", ...]
+        script = (
+            "Get-CimInstance Win32_DiskDrive | ForEach-Object { "
+            "'{0} - {1} ({2} GB)' -f $_.DeviceID, $_.Model, [math]::Round($_.Size/1GB) }"
+        )
+        try:
+            out = run(
+                ["powershell", "-NoProfile", "-Command", script],
+                stdout=PIPE, stderr=PIPE, text=True, timeout=20,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def refresh_drives(self):
+        self.phys_box["values"] = self.list_physical_drives()
+
+    def is_admin(self):
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (AttributeError, OSError):
+            return True
+
+    def find_aarch64_firmware(self):
+        # edk2 UEFI firmware ships in <qemu dir>\share
+        exe = which("qemu-system-aarch64")
+        if not exe:
+            return None
+        base = os.path.dirname(exe)
+        for rel in ("share/edk2-aarch64-code.fd", "edk2-aarch64-code.fd"):
+            path = os.path.join(base, rel)
+            if os.path.exists(path):
+                return path
+        return None
 
     def is_tool(self, name):
         # Check whether `name` is on PATH and marked as executable
@@ -248,14 +290,34 @@ class Manager:
             use_cdrom = self.qemu_use_cdrom.get()
             hdd = self.hdd_path.get().strip()
 
-            # Without a CD-ROM there must be an HDD to boot from
-            if not use_cdrom and not os.path.exists(hdd):
+            use_phys = self.qemu_use_phys.get()
+            phys = self.qemu_phys_path.get().split(" - ")[0].strip()
+            arm = self.qemu_type_box.get() == "qemu-system-aarch64"
+
+            # Without a CD-ROM there must be something to boot from
+            if not use_cdrom and not use_phys and not os.path.exists(hdd):
                 alert(
                     "Unable to start the VM",
-                    "CD-ROM is disabled, so the HDD file must exist to boot from it.",
+                    "CD-ROM is disabled, so the HDD file or a physical drive must be set to boot from.",
                     icon="error",
                 )
                 return 1
+
+            if use_phys:
+                prefix = "\\\\.\\PHYSICALDRIVE"
+                if not phys.upper().startswith(prefix) or not phys[len(prefix):].isdigit():
+                    alert(
+                        "Unable to start the VM",
+                        "Physical drive must look like \\\\.\\PhysicalDrive4",
+                        icon="error",
+                    )
+                    return 1
+                if not self.is_admin() and not confirm(
+                    "Administrator required",
+                    "Raw access to a physical drive needs Administrator rights and this program isn't elevated, so QEMU will probably fail to open it.\n\nStart anyway?",
+                    icon="warning",
+                ):
+                    return 1
 
             # Check if the CD-ROM file exists
             if use_cdrom and not os.path.exists(self.cdrom_path.get()):
@@ -300,16 +362,49 @@ class Manager:
                 self.qemu_type_box.get(),
                 "-m", str(int(ram_gb * 1024)),
             ]
+            if arm:
+                # The virt machine has no IDE/VGA/USB by default
+                cmd += ["-M", "virt", "-cpu", "cortex-a72"]
+                firmware = self.find_aarch64_firmware()
+                if firmware:
+                    cmd += ["-bios", firmware]
+                cmd += [
+                    "-device", "ramfb",
+                    "-device", "qemu-xhci",
+                    "-device", "usb-kbd",
+                    "-device", "usb-mouse",
+                    "-serial", "stdio",
+                ]
+
             if use_cdrom:
-                cmd += ["-cdrom", self.cdrom_path.get()]
+                if arm:
+                    cmd += [
+                        "-drive", f"file={self.cdrom_path.get()},media=cdrom,if=none,id=cd0,readonly=on",
+                        "-device", "usb-storage,drive=cd0",
+                    ]
+                else:
+                    cmd += ["-cdrom", self.cdrom_path.get()]
             if hdd and os.path.exists(hdd):
-                cmd += ["-hda", hdd]
-                if not use_cdrom:
+                if arm:
+                    cmd += ["-drive", f"file={hdd},if=virtio"]
+                else:
+                    cmd += ["-hda", hdd]
+                if not use_cdrom and not use_phys:
                     cmd += ["-boot", "c"]
+            if use_phys:
+                ro = ",readonly=on" if self.qemu_phys_readonly.get() else ""
+                if arm:
+                    cmd += ["-drive", f"file={phys},format=raw,if=virtio{ro}"]
+                else:
+                    cmd += [
+                        "-drive", f"file={phys},format=raw,if=none,id=physdrv{ro}",
+                        "-device", "qemu-xhci",
+                        "-device", "usb-storage,drive=physdrv,bootindex=0",
+                    ]
             cmd += nic
             if self.qemu_sdl_window.get():
                 cmd += ["-sdl"]
-            if self.qemu_use_haxm.get():
+            if self.qemu_use_haxm.get() and not arm:
                 cmd += ["-accel", "hax"]
 
             if use_cdrom:
@@ -318,7 +413,11 @@ class Manager:
                 self.remember_path("hdd_history", hdd)
 
             # Open QEMU in the background using subprocess.Popen()
-            self.qemu_process = Popen(cmd, stdout=PIPE, stderr=PIPE)
+            if arm:
+                # -serial stdio: give QEMU its own console for the serial output
+                self.qemu_process = Popen(cmd, creationflags=CREATE_NEW_CONSOLE)
+            else:
+                self.qemu_process = Popen(cmd, stdout=PIPE, stderr=PIPE)
 
         except CalledProcessError as e:
             # TODO: Improve error messages
@@ -388,14 +487,14 @@ class Manager:
             self.root, text="Start VM", command=self.start_vm
         )
         self.start_vm_btn.pack(ipadx=10, ipady=10, padx=10, pady=10)
-        self.start_vm_btn.place(x=490, y=505)
+        self.start_vm_btn.place(x=490, y=625)
 
         # Add a button to kill the VM
         self.kill_vm_btn = ttk.Button(
             self.root, text="Terminate QEMU", command=self.kill_vm
         )
         self.kill_vm_btn.pack(ipadx=10, ipady=10, padx=10, pady=10)
-        self.kill_vm_btn.place(x=360, y=505)
+        self.kill_vm_btn.place(x=360, y=625)
 
         qemu_type_box_label = ttk.Label(
             self.root, text="CPU Architecture:", background=self.root.cget("background")
@@ -413,6 +512,7 @@ class Manager:
             "qemu-system-x86_64",
             "qemu-system-ppc",
             "qemu-system-ppc64",
+            "qemu-system-aarch64",
         )
         self.qemu_type_box.current(1)
         self.qemu_type_box.pack(fill=tk.X, padx=15, pady=5)
@@ -470,6 +570,32 @@ class Manager:
         self.create_hdd_btn.grid(row=0, column=1, padx=(5, 15))
 
         self.hdd_path_frame.pack(fill="x")
+
+        phys_check = ttk.Checkbutton(
+            self.root,
+            text="Boot from physical drive / USB (needs Administrator):",
+            variable=self.qemu_use_phys,
+            offvalue=False,
+            onvalue=True,
+        )
+        phys_check.pack(fill="x", padx=15, pady=(10, 2))
+
+        phys_frame = tk.Frame(self.root, bg=self.root.cget("background"))
+        phys_frame.grid_columnconfigure(0, weight=1)
+        self.phys_box = ttk.Combobox(phys_frame, textvariable=self.qemu_phys_path)
+        self.phys_box.grid(row=0, column=0, sticky="we", padx=(15, 0))
+        ttk.Button(phys_frame, text="Detect", command=self.refresh_drives).grid(
+            row=0, column=1, padx=(5, 15)
+        )
+        phys_frame.pack(fill="x")
+
+        ttk.Checkbutton(
+            self.root,
+            text="Read-only (recommended, protects the drive)",
+            variable=self.qemu_phys_readonly,
+            offvalue=False,
+            onvalue=True,
+        ).pack(fill="x", padx=15, pady=2)
 
         ram_label = ttk.Label(
             self.root, text="RAM (GB):", background=self.root.cget("background")
