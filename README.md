@@ -1,4 +1,6 @@
 # qemuman
+THIS IS NOT MINE WORK BUT A FOR FROM: https://github.com/yeppiidev/qemu-manager
+
 A lightweight GUI Frontend for QEMU written in Python
 
 ![image](https://user-images.githubusercontent.com/52355164/151694029-24e0ca80-a866-4986-b0f5-fe8cc98fb71f.png)
