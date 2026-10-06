@@ -22,6 +22,7 @@ from shutil import which
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qemuman_config.json")
 MAX_HISTORY = 15
 # VGA memory must be a power of two. bochs-display (used for ARM) tops out at 256 MB.
+X86_BINARIES = ("qemu-system-i386", "qemu-system-x86_64")
 VRAM_MIN_MB = 16
 VRAM_ARM_MAX_MB = 256
 VRAM_ABS_MAX_MB = 4096
@@ -112,12 +113,17 @@ class Manager:
         self.qemu_sdl_window = tk.BooleanVar()
         self.qemu_sdl_window.set(False)
 
-        self.qemu_use_haxm = tk.BooleanVar()
-        self.qemu_use_haxm.set(False)
+        # WHPX = Windows Hypervisor Platform: hardware acceleration for x86 guests
+        self.qemu_use_whpx = tk.BooleanVar(value=True)
 
         self.qemu_ram_gb = tk.StringVar(value="4")
 
         self.config = self.load_config()
+
+        # Default to 4 vCPUs (or fewer on small hosts); one vCPU makes emulation crawl
+        self.cpu_count = os.cpu_count() or 4
+        saved_cores = self.config.get("cpu_cores")
+        self.qemu_cpu_cores = tk.StringVar(value=str(saved_cores or min(4, self.cpu_count)))
         self.qemu_use_cdrom = tk.BooleanVar(value=self.config.get("use_cdrom", True))
         self.qemu_use_cdrom.trace_add("write", self.on_cdrom_toggle)
         self.qemu_use_hdd = tk.BooleanVar(value=self.config.get("use_hdd", True))
@@ -453,15 +459,35 @@ class Manager:
                     return 1
                 nic = ["-nic", f"user,hostfwd=tcp::{host_port}-:{guest_port}"]
 
-            vram_mb = self.qemu_vram_mb.get()
+            # The slider range depends on the architecture; never exceed its limit
+            vram_mb = min(self.qemu_vram_mb.get(), self.compute_vram_steps(arm)[-1])
+
+            # Validate CPU cores
+            try:
+                cores = int(self.qemu_cpu_cores.get())
+                if not 1 <= cores <= 256:
+                    raise ValueError
+            except ValueError:
+                alert(
+                    "Unable to start the VM",
+                    "CPU cores must be a whole number of 1 or more.",
+                    icon="error",
+                )
+                return 1
+            self.config["cpu_cores"] = cores
+            self.save_config()
 
             cmd = [
                 self.qemu_type_box.get(),
                 "-m", str(int(ram_gb * 1024)),
+                "-smp", str(cores),
             ]
             if arm:
                 # The virt machine has no IDE/VGA/USB by default
                 cmd += ["-M", "virt", "-cpu", "cortex-a72"]
+                # Run guest vCPUs on separate host threads and keep a big
+                # translation cache; this is what makes emulated ARM usable
+                cmd += ["-accel", "tcg,thread=multi,tb-size=1024"]
                 firmware = self.find_aarch64_firmware()
                 if firmware:
                     cmd += ["-bios", firmware]
@@ -504,8 +530,9 @@ class Manager:
             cmd += nic
             if self.qemu_sdl_window.get():
                 cmd += ["-sdl"]
-            if self.qemu_use_haxm.get() and not arm:
-                cmd += ["-accel", "hax"]
+            if self.qemu_use_whpx.get() and self.qemu_type_box.get() in X86_BINARIES:
+                # Falls back to software emulation if WHPX isn't enabled in Windows
+                cmd += ["-accel", "whpx,kernel-irqchip=off", "-accel", "tcg"]
 
             if use_cdrom:
                 self.remember_path("iso_history", self.cdrom_path.get())
@@ -716,15 +743,24 @@ class Manager:
             onvalue=True,
         ).pack(fill="x", padx=15, pady=2)
 
-        ram_label = ttk.Label(
-            self.root, text="RAM (GB):", background=self.root.cget("background")
-        )
-        ram_label.pack(fill="x", padx=15, pady=(10, 0))
-
+        res_frame = tk.Frame(self.root, bg=self.root.cget("background"))
+        res_frame.pack(fill="x", padx=15, pady=(10, 5))
+        ttk.Label(
+            res_frame, text="RAM (GB):", background=self.root.cget("background")
+        ).pack(side=LEFT)
         self.qemu_ram_box = ttk.Spinbox(
-            self.root, from_=1, to=1024, textvariable=self.qemu_ram_gb
+            res_frame, from_=1, to=1024, width=8, textvariable=self.qemu_ram_gb
         )
-        self.qemu_ram_box.pack(fill="x", padx=15, pady=5)
+        self.qemu_ram_box.pack(side=LEFT, padx=(5, 20))
+        ttk.Label(
+            res_frame,
+            text=f"CPU cores (host has {self.cpu_count}):",
+            background=self.root.cget("background"),
+        ).pack(side=LEFT)
+        self.qemu_cpu_box = ttk.Spinbox(
+            res_frame, from_=1, to=self.cpu_count, width=8, textvariable=self.qemu_cpu_cores
+        )
+        self.qemu_cpu_box.pack(side=LEFT, padx=5)
 
         ssh_check = ttk.Checkbutton(
             self.root,
@@ -759,14 +795,14 @@ class Manager:
         )
         qemu_sdl_window.pack(fill="x", padx=15, pady=(10, 2))
 
-        qemu_use_haxm = ttk.Checkbutton(
+        qemu_use_whpx = ttk.Checkbutton(
             self.root,
-            text="Use Intel HAXM? (Requires you to have HAXM installed)",
-            variable=self.qemu_use_haxm,
+            text="Hardware acceleration (WHPX, x86 only; much faster, needs 'Windows Hypervisor Platform')",
+            variable=self.qemu_use_whpx,
             offvalue=False,
             onvalue=True,
         )
-        qemu_use_haxm.pack(fill="x", padx=15, pady=2)
+        qemu_use_whpx.pack(fill="x", padx=15, pady=2)
 
         qemu_kill_on_exit_box = ttk.Checkbutton(
             self.root,
