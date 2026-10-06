@@ -21,7 +21,12 @@ from shutil import which
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qemuman_config.json")
 MAX_HISTORY = 15
-VRAM_STEPS = (16, 32, 64, 128, 256)  # VGA memory must be a power of two
+# VGA memory must be a power of two. bochs-display (used for ARM) tops out at 256 MB.
+VRAM_MIN_MB = 16
+VRAM_ARM_MAX_MB = 256
+VRAM_ABS_MAX_MB = 4096
+VRAM_FALLBACK_GPU_MB = 2048  # assumed when the GPU can't be detected
+VRAM_COLORS = {"ok": "#2e9e4f", "high": "#d08a00", "too_much": "#d33a3a"}
 
 qemu_process = None
 qemu_type_box = None
@@ -118,9 +123,9 @@ class Manager:
         self.qemu_use_hdd = tk.BooleanVar(value=self.config.get("use_hdd", True))
         self.qemu_use_hdd.trace_add("write", self.on_hdd_toggle)
 
-        self.qemu_vram_mb = tk.IntVar(
-            value=self.config.get("vram_mb") if self.config.get("vram_mb") in VRAM_STEPS else 64
-        )
+        self.gpu_vram_mb = self.detect_gpu_vram_mb()
+        self.vram_steps = self.compute_vram_steps(arm=False)
+        self.qemu_vram_mb = tk.IntVar(value=self.snap_vram(self.config.get("vram_mb", 64)))
 
         self.qemu_use_phys = tk.BooleanVar(value=False)
         self.qemu_phys_path = tk.StringVar(value=r"\\.\PhysicalDrive")
@@ -222,13 +227,79 @@ class Manager:
             self.hdd_path.configure(state=state)
             self.create_hdd_btn.configure(state=state)
 
+    def detect_gpu_vram_mb(self):
+        # AdapterRAM from WMI is a 32-bit value (wrong above 4 GB), so read the
+        # 64-bit size the driver stores in the registry instead. Returns the largest GPU.
+        script = (
+            "Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\\"
+            "{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue | "
+            "ForEach-Object { (Get-ItemProperty $_.PSPath).'HardwareInformation.qwMemorySize' } | "
+            "Where-Object { $_ } | ForEach-Object { [math]::Round($_/1MB) }"
+        )
+        try:
+            out = run(
+                ["powershell", "-NoProfile", "-Command", script],
+                stdout=PIPE, stderr=PIPE, text=True, timeout=20,
+            ).stdout
+            sizes = [int(x) for x in out.split() if x.isdigit()]
+        except (OSError, subprocess.SubprocessError):
+            sizes = []
+        return max(sizes) if sizes else None
+
+    def compute_vram_steps(self, arm):
+        gpu = self.gpu_vram_mb or VRAM_FALLBACK_GPU_MB
+        limit = min(gpu, VRAM_ARM_MAX_MB if arm else VRAM_ABS_MAX_MB)
+        steps = [VRAM_MIN_MB]
+        while steps[-1] * 2 <= limit:
+            steps.append(steps[-1] * 2)
+        return steps
+
+    def snap_vram(self, mb):
+        # Largest allowed step that doesn't exceed `mb`
+        try:
+            mb = int(mb)
+        except (TypeError, ValueError):
+            mb = 64
+        fits = [x for x in self.vram_steps if x <= mb]
+        return fits[-1] if fits else self.vram_steps[0]
+
+    def vram_level(self, mb):
+        gpu = self.gpu_vram_mb or VRAM_FALLBACK_GPU_MB
+        if mb <= gpu * 0.25:
+            return "ok", "OK"
+        if mb <= gpu * 0.5:
+            return "high", "high"
+        return "too_much", "too much"
+
+    def refresh_vram_label(self):
+        mb = self.qemu_vram_mb.get()
+        key, word = self.vram_level(mb)
+        if self.gpu_vram_mb:
+            note = f"{word} for your {self.gpu_vram_mb} MB GPU"
+        else:
+            note = f"{word} (GPU not detected, assuming {VRAM_FALLBACK_GPU_MB} MB)"
+        self.vram_label.configure(
+            text=f"Video RAM: {mb} MB - {note}", foreground=VRAM_COLORS[key]
+        )
+
     def on_vram_slide(self, value):
         # Snap the slider to the nearest allowed step
-        mb = VRAM_STEPS[int(round(float(value)))]
+        idx = min(max(int(round(float(value))), 0), len(self.vram_steps) - 1)
+        mb = self.vram_steps[idx]
         self.qemu_vram_mb.set(mb)
-        self.vram_label.configure(text=f"Video RAM: {mb} MB")
+        self.refresh_vram_label()
         self.config["vram_mb"] = mb
         self.save_config()
+
+    def update_vram_range(self, *_):
+        # ARM's display device supports less video memory than x86's
+        arm = self.qemu_type_box.get() == "qemu-system-aarch64"
+        self.vram_steps = self.compute_vram_steps(arm)
+        mb = self.snap_vram(self.qemu_vram_mb.get())
+        self.vram_slider.configure(to=len(self.vram_steps) - 1)
+        self.vram_slider.set(self.vram_steps.index(mb))
+        self.qemu_vram_mb.set(mb)
+        self.refresh_vram_label()
 
     def is_tool(self, name):
         # Check whether `name` is on PATH and marked as executable
@@ -604,21 +675,20 @@ class Manager:
         self.on_hdd_toggle()
 
         self.vram_label = ttk.Label(
-            self.root,
-            text=f"Video RAM: {self.qemu_vram_mb.get()} MB",
-            background=self.root.cget("background"),
+            self.root, background=self.root.cget("background")
         )
         self.vram_label.pack(fill="x", padx=15, pady=(8, 0))
 
         self.vram_slider = ttk.Scale(
             self.root,
             from_=0,
-            to=len(VRAM_STEPS) - 1,
+            to=len(self.vram_steps) - 1,
             orient="horizontal",
             command=self.on_vram_slide,
         )
-        self.vram_slider.set(VRAM_STEPS.index(self.qemu_vram_mb.get()))
         self.vram_slider.pack(fill="x", padx=15, pady=5)
+        self.update_vram_range()
+        self.qemu_type_box.bind("<<ComboboxSelected>>", self.update_vram_range)
 
         phys_check = ttk.Checkbutton(
             self.root,
