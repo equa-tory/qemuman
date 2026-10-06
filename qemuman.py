@@ -21,6 +21,7 @@ from shutil import which
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qemuman_config.json")
 MAX_HISTORY = 15
+VRAM_STEPS = (16, 32, 64, 128, 256)  # VGA memory must be a power of two
 
 qemu_process = None
 qemu_type_box = None
@@ -92,7 +93,7 @@ class Manager:
     def __init__(self) -> None:
         self.root = ThemedTk()
         self.root.title("QEMU Manager")
-        self.root.geometry("600x680")
+        self.root.geometry("600x740")
         self.root.wm_resizable(False, False)
 
         self.root.style = ttk.Style()
@@ -116,6 +117,10 @@ class Manager:
         self.qemu_use_cdrom.trace_add("write", self.on_cdrom_toggle)
         self.qemu_use_hdd = tk.BooleanVar(value=self.config.get("use_hdd", True))
         self.qemu_use_hdd.trace_add("write", self.on_hdd_toggle)
+
+        self.qemu_vram_mb = tk.IntVar(
+            value=self.config.get("vram_mb") if self.config.get("vram_mb") in VRAM_STEPS else 64
+        )
 
         self.qemu_use_phys = tk.BooleanVar(value=False)
         self.qemu_phys_path = tk.StringVar(value=r"\\.\PhysicalDrive")
@@ -216,6 +221,14 @@ class Manager:
             state = "normal" if self.qemu_use_hdd.get() else "disabled"
             self.hdd_path.configure(state=state)
             self.create_hdd_btn.configure(state=state)
+
+    def on_vram_slide(self, value):
+        # Snap the slider to the nearest allowed step
+        mb = VRAM_STEPS[int(round(float(value)))]
+        self.qemu_vram_mb.set(mb)
+        self.vram_label.configure(text=f"Video RAM: {mb} MB")
+        self.config["vram_mb"] = mb
+        self.save_config()
 
     def is_tool(self, name):
         # Check whether `name` is on PATH and marked as executable
@@ -369,6 +382,8 @@ class Manager:
                     return 1
                 nic = ["-nic", f"user,hostfwd=tcp::{host_port}-:{guest_port}"]
 
+            vram_mb = self.qemu_vram_mb.get()
+
             cmd = [
                 self.qemu_type_box.get(),
                 "-m", str(int(ram_gb * 1024)),
@@ -380,12 +395,15 @@ class Manager:
                 if firmware:
                     cmd += ["-bios", firmware]
                 cmd += [
-                    "-device", "ramfb",
+                    "-device", f"bochs-display,vgamem={vram_mb << 20}",
                     "-device", "qemu-xhci",
                     "-device", "usb-kbd",
                     "-device", "usb-mouse",
                     "-serial", "stdio",
                 ]
+
+            else:
+                cmd += ["-vga", "std", "-global", f"VGA.vgamem_mb={vram_mb}"]
 
             if use_cdrom:
                 if arm:
@@ -498,14 +516,14 @@ class Manager:
             self.root, text="Start VM", command=self.start_vm
         )
         self.start_vm_btn.pack(ipadx=10, ipady=10, padx=10, pady=10)
-        self.start_vm_btn.place(x=490, y=625)
+        self.start_vm_btn.place(x=490, y=685)
 
         # Add a button to kill the VM
         self.kill_vm_btn = ttk.Button(
             self.root, text="Terminate QEMU", command=self.kill_vm
         )
         self.kill_vm_btn.pack(ipadx=10, ipady=10, padx=10, pady=10)
-        self.kill_vm_btn.place(x=360, y=625)
+        self.kill_vm_btn.place(x=360, y=685)
 
         qemu_type_box_label = ttk.Label(
             self.root, text="CPU Architecture:", background=self.root.cget("background")
@@ -584,6 +602,23 @@ class Manager:
 
         self.hdd_path_frame.pack(fill="x")
         self.on_hdd_toggle()
+
+        self.vram_label = ttk.Label(
+            self.root,
+            text=f"Video RAM: {self.qemu_vram_mb.get()} MB",
+            background=self.root.cget("background"),
+        )
+        self.vram_label.pack(fill="x", padx=15, pady=(8, 0))
+
+        self.vram_slider = ttk.Scale(
+            self.root,
+            from_=0,
+            to=len(VRAM_STEPS) - 1,
+            orient="horizontal",
+            command=self.on_vram_slide,
+        )
+        self.vram_slider.set(VRAM_STEPS.index(self.qemu_vram_mb.get()))
+        self.vram_slider.pack(fill="x", padx=15, pady=5)
 
         phys_check = ttk.Checkbutton(
             self.root,
