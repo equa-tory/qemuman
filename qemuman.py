@@ -9,7 +9,13 @@ import tkinter as tk
 import atexit
 
 from subprocess import PIPE
-from subprocess import Popen, CalledProcessError, run, CREATE_NEW_CONSOLE
+from subprocess import Popen, CalledProcessError, run
+import os
+
+if os.name == "nt":
+    from subprocess import CREATE_NEW_CONSOLE
+else:
+    CREATE_NEW_CONSOLE = 0
 
 from tkinter.messagebox import showinfo as alert
 from tkinter.messagebox import askyesno as confirm
